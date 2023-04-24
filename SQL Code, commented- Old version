@@ -1,3 +1,7 @@
+---- This method did not work for me, because I was creating one tier at a time so all of the "All" values (the unpivoted column) that were level 1 did not have any of their Tier 2-4 information attached.
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
 -- First CTE: tiered_food_departments
 -- This CTE groups food departments into their respective tiers and associates them with a unique ID and full name.
 WITH tiered_food_departments AS (
