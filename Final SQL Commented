@@ -1,0 +1,78 @@
+-- First, create a CTE that retrieves the product categories and their aisle structure
+WITH tiered_aisles AS (
+    SELECT
+        aisles.id,
+        aisles.full_name,
+        (array_agg(aisle_hierarchy.name))[1] as aisle_1,
+        -- The first aisle is found by aggregating the names of the aisles in the hierarchy,
+        -- and then selecting the first name from the aggregated array
+        (array_agg(aisle_hierarchy.name))[2] as aisle_2,
+        -- The second aisle is found by aggregating the names of the aisles in the hierarchy,
+        -- and then selecting the second name from the aggregated array
+        (array_agg(aisle_hierarchy.name))[3] as aisle_3,
+        (array_agg(aisle_hierarchy.name))[4] as aisle_4
+    FROM aisles
+    JOIN LATERAL ( -- Join using a LATERAL subquery to retrieve the aisle names and their order
+    SELECT name, row_number() OVER (ORDER BY a1.left) aisle
+    FROM aisles a1
+    WHERE a1.id != 1 AND a1.left <= aisles.left AND a1.right >= aisles.right
+    -- Filter to keep only the leaf nodes
+    ORDER BY a1.left
+    ) AS aisle_hierarchy ON true
+    WHERE aisles.left = aisles.right - 1
+    GROUP BY aisles.id
+    ORDER BY aisle_1, aisle_2, aisle_3, aisle_4
+),
+-- Create a CTE that adds parent information to each aisle level
+add_parents AS (
+    SELECT
+        id,
+        full_name,
+        aisle_1 AS aisle_1,
+        CASE
+        WHEN aisle_2 IS NOT NULL THEN aisle_2 || ' - ' || aisle_1
+        ELSE NULL -- Add parent information to aisle_2, only when it exists
+        END AS aisle_2,
+        aisle_2 AS original_aisle_2,
+        CASE
+                WHEN aisle_3 IS NOT NULL THEN aisle_3 || ' - ' || aisle_2
+                ELSE NULL
+            END AS aisle_3,
+        aisle_3 AS original_aisle_3,
+            CASE
+                WHEN aisle_4 IS NOT NULL THEN aisle_4 || ' - ' || aisle_3
+                ELSE NULL
+            END AS aisle_4,
+        aisle_4 AS original_aisle_4,
+        aisle_1 AS root,  -- Store aisle_1 as the root level
+        COALESCE(aisle_4 || ' - ' || aisle_3, aisle_3 || ' - ' || aisle_2, aisle_2 || ' - ' || aisle_1) AS leaf
+    -- Use COALESCE to find the leaf level by prioritizing the longest path
+    FROM tiered_aisles
+    ORDER BY id
+),
+-- Create a CTE that unpivots the aisle information, so that each row contains information for a single aisle
+unpivoted AS (
+    SELECT id, full_name, aisle_1 AS component, aisle_1 AS original_name, NULL AS parent, NULL AS original_parent, root, leaf, 1 AS level FROM add_parents
+        UNION ALL
+    SELECT id, full_name, aisle_2 AS component, original_aisle_2 AS original_name, aisle_1 AS parent, aisle_1 AS original_parent, root, leaf, 2 AS level FROM add_parents WHERE aisle_2 IS NOT NULL
+        UNION ALL
+    SELECT id, full_name, aisle_3 AS component,    original_aisle_3 AS original_name, aisle_2 AS parent, original_aisle_2 AS original_parent, root, leaf, 3 AS level FROM add_parents WHERE aisle_3 IS NOT NULL
+        UNION ALL
+    SELECT id, full_name, aisle_4 AS component, original_aisle_4 AS original_name, aisle_3 AS parent, original_aisle_3 AS original_parent, root, leaf, 4 AS level FROM add_parents WHERE aisle_4 IS NOT NULL
+)
+-- Finally, select the desired columns and join the unpivoted CTE with the add_parents CTE
+SELECT
+    u.*,
+    p.aisle_1,
+    p.aisle_2,
+    p.aisle_3,
+    p.aisle_4,
+    u.original_name AS original_name_n,
+    u.original_parent AS parent_join,
+    dense_rank() OVER (ORDER BY u.level, p.aisle_1, u.parent, u.original_name) AS sort
+    -- Sort according to the levels and keep them in order that their parents and roots are in
+FROM
+    unpivoted AS u
+LEFT JOIN add_parents AS p ON u.leaf = p.leaf AND u.root = p.root
+ORDER BY
+    sort
