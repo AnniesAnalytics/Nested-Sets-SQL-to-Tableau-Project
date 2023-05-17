@@ -1,0 +1,197 @@
+-- Create a CTE that retrieves the product classes and their tier structure
+WITH tiered_product_classes AS (
+    SELECT
+        pc.id AS p_c_id,
+        pc.full_name,
+        (array_agg(tiers.name))[1] as tier_1,
+        (array_agg(tiers.name))[2] as tier_2,
+        (array_agg(tiers.name))[3] as tier_3,
+        (array_agg(tiers.name))[4] as tier_4
+    FROM sales s
+    LEFT JOIN products p
+    ON s.product_id = p.id
+    LEFT JOIN product_classes pc
+    ON p.product_class_id = pc.id
+    JOIN LATERAL (
+    SELECT name, row_number() OVER (ORDER BY t1.left) tier
+    FROM product_classes t1
+    WHERE t1.id != 1 AND t1.left <= pc.left AND t1.right >= pc.right
+    ORDER BY t1.left
+    ) AS tiers ON true
+    WHERE s.sale_amount > 0 AND pc.left = pc.right - 1
+    GROUP BY pc.id, pc.full_name
+    ORDER BY tier_1, tier_2, tier_3, tier_4
+),
+ -- Filling in nulls
+fill_null_tiers AS (
+    SELECT
+        p_c_id,
+        full_name,
+        tier_1,
+        COALESCE(tier_2, tier_1 || ' (n)') AS tier_2,
+        COALESCE(tier_3, CASE WHEN tier_3 IS NULL THEN tier_2 || ' (n)' ELSE tier_2 END, tier_1 || ' (n)') AS tier_3,
+        COALESCE(tier_4, CASE WHEN tier_4 IS NULL THEN tier_3 || ' (n)' ELSE tier_3 END, tier_2 || ' (n)', tier_1 || ' (n)') AS tier_4
+    FROM tiered_product_classes
+    ),
+
+-- Create a CTE that adds parent information to each tier level
+add_parents AS (
+    SELECT
+        p_c_id,
+        full_name,
+        tier_1 AS tier_1,
+        tier_2 || ' - ' || tier_1 AS tier_2,
+        tier_2 AS original_tier_2, -- keep track of the original name
+        CASE WHEN POSITION('(n)' IN tier_3) != 0 THEN tier_3 || ' - ' || tier_2 || ' - ' || tier_1
+             ELSE tier_3 || ' - ' || tier_2 END AS tier_3,
+        tier_3 AS original_tier_3,
+        CASE WHEN POSITION('(n)' IN tier_4) != 0 THEN tier_4 || ' - ' || tier_3 || ' - ' || tier_2 || ' - ' || tier_1
+             ELSE tier_4 || ' - ' || tier_3 END AS tier_4,
+        tier_4 AS original_tier_4,
+        tier_1 AS root,  -- Store tier_1 as the root level
+        CASE
+            WHEN POSITION('(n)' IN tier_4) = 0 THEN tier_4 || ' - ' || tier_3
+            WHEN POSITION('(n)' IN tier_3) = 0 THEN tier_3 || ' - ' || tier_2
+            WHEN POSITION('(n)' IN tier_2) = 0 THEN tier_2 || ' - ' || tier_1
+            ELSE tier_1
+        END AS leaf# Continue with the remaining parts of the query
+"""
+    FROM fill_null_tiers
+    ORDER BY p_c_id
+),
+
+-- Add in the sale_amount from sales
+sale_amounts AS (
+    SELECT SUM(s.sale_amount/100) AS sale_amount_class, --stored as cents
+        ap.p_c_id AS pcid
+    FROM add_parents ap
+    LEFT JOIN products p
+    ON ap.p_c_id = p.product_class_id
+    LEFT JOIN sales s
+    ON p.id = s.product_id
+    GROUP BY pcid
+),
+
+-- Add together the sale amounts and the rest of add parents, and add the value_n column for handling nulls later
+sales_and_tiers AS (
+    SELECT
+        ap.*,
+        sa.sale_amount_class,
+        CASE
+            WHEN POSITION('(n)' IN ap.tier_1) != 0 THEN sa.sale_amount_class
+            WHEN POSITION('(n)' IN ap.tier_2) != 0 THEN sa.sale_amount_class
+            WHEN POSITION('(n)' IN ap.tier_3) != 0 THEN sa.sale_amount_class
+            WHEN POSITION('(n)' IN ap.tier_4) != 0 THEN sa.sale_amount_class
+            ELSE NULL
+        END AS n_value
+    FROM sale_amounts sa
+    LEFT JOIN add_parents ap
+    ON  sa.pcid = ap.p_c_id
+),
+
+-- Create a CTE that unpivots the tier information, so that each row contains information for a single tier
+unpivoted AS (
+    SELECT
+        p_c_id,
+        full_name,
+        tier_1 AS component,
+        tier_1 AS original_name,
+        NULL AS parent,
+        NULL AS original_parent,
+        root,
+        leaf,
+        1 AS level,
+        n_value,
+        CASE WHEN tier_1 = leaf THEN sale_amount_class END AS lowest_level_value
+    FROM sales_and_tiers
+
+    UNION ALL
+
+    SELECT
+        p_c_id,
+        full_name,
+        tier_2 AS component,
+        original_tier_2 AS original_name,
+        tier_1 AS parent,
+        tier_1 AS original_parent,
+        root,
+        leaf,
+        2 AS level,
+        n_value,
+        CASE WHEN tier_2 = leaf THEN sale_amount_class END AS lowest_level_value
+    FROM sales_and_tiers WHERE tier_2 IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        p_c_id,
+        full_name,
+        tier_3 AS component,
+        original_tier_3 AS original_name,
+        tier_2 AS parent,
+        original_tier_2 AS original_parent,
+        root,
+        leaf,
+        3 AS level,
+        n_value,
+        CASE WHEN tier_3 = leaf THEN sale_amount_class END AS lowest_level_value
+    FROM sales_and_tiers WHERE tier_3 IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        p_c_id,
+        full_name,
+        tier_4 AS component,
+        original_tier_4 AS original_name,
+        tier_3 AS parent,
+        original_tier_3 AS original_parent,
+        root,
+        leaf,
+        4 AS level,
+        n_value,
+        CASE WHEN tier_4 = leaf THEN sale_amount_class END AS lowest_level_value
+    FROM sales_and_tiers WHERE tier_4 IS NOT NULL
+),
+
+-- Grouped by product class id, if the component is the maximum "level" for that component, return "lowest level value"
+-- otherwise, sum up the "lowest level value" rows where the "Parent" matches the "component" in the current row.
+-- Grouped by product class id, if the component is the maximum "level" for that component, return "lowest level value"
+-- otherwise, sum up the "lowest level value" rows where the "Parent" matches the "component" in the current row.
+add_value AS (
+    SELECT
+        unpivoted.p_c_id AS prodid,
+        unpivoted.component,
+        unpivoted.level,
+        CASE
+            WHEN unpivoted.lowest_level_value IS NOT NULL THEN unpivoted.lowest_level_value
+            WHEN unpivoted.lowest_level_value IS NULL AND n_value IS NULL THEN (
+                SELECT SUM(inner_unpivoted.lowest_level_value)
+                FROM unpivoted AS inner_unpivoted
+                WHERE inner_unpivoted.parent = unpivoted.component
+                  AND inner_unpivoted.p_c_id = unpivoted.p_c_id
+                  AND inner_unpivoted.lowest_level_value IS NOT NULL
+            )
+            ELSE n_value
+        END AS value
+    FROM unpivoted
+)
+-- Finally, select the desired columns and join the unpivoted CTE with the add_parents CTE
+SELECT
+    u.*,
+    p.tier_1,
+    p.tier_2,
+    p.tier_3,
+    p.tier_4,
+    u.original_name AS original_name_n,
+    u.original_parent AS parent_join,
+    dense_rank() OVER (ORDER BY u.level, p.tier_1, u.parent, u.original_name) AS sort,
+    -- Sort according to the levels and keep them in order that their parents and roots are in
+    av.value
+FROM
+    unpivoted AS u
+LEFT JOIN add_parents AS p ON u.leaf = p.leaf AND u.root = p.root
+LEFT JOIN add_value av ON u.p_c_id = av.prodid
+ORDER BY
+    sort
+;
