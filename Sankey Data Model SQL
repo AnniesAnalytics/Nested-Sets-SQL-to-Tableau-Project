@@ -1,0 +1,87 @@
+-- indexing and pulling this year's data
+WITH cte AS (
+    SELECT date, sale_id,
+        DENSE_RANK() OVER(PARTITION BY sale_id ORDER BY date) as d_index
+    FROM sales_runs
+    WHERE date_part('year', date) = date_part('year', CURRENT_DATE)
+),
+
+-- pulling the sale method of the final sale date
+cte2 AS (
+    SELECT sr.sale_id, sr.date,
+        CASE WHEN MAX(s.sale_date) OVER (PARTITION BY sr.sale_id) = sr.date THEN s.sale_method ELSE 'Rejected' END AS end_method
+    FROM sales_runs sr
+    JOIN sales s
+    ON sr.sale_id = s.id
+),
+
+-- adding back in the index and dates to the final date
+cte3 AS (
+    SELECT cte.date, cte.sale_id, cte.d_index, cte2.end_method
+    FROM cte
+    JOIN cte2
+    ON cte.sale_id = cte2.sale_id AND cte.date = cte2.date
+),
+
+-- cleaning up the otherwise missing pieces of the sankey
+cte4 AS (
+    SELECT s.sale_amount, p.product_class_id, cte3.*, pc.name AS class_name,
+        CASE
+            WHEN cte3.sale_id IS NULL THEN 'Null ID'
+            ELSE 'Pre-sale'
+        END AS Step_1,
+        CASE
+            WHEN cte3.d_index = 1 AND cte3.end_method IS NOT NULL THEN cte3.end_method
+            WHEN cte3.sale_id IS NULL THEN 'Null ID'
+            ELSE 'Error'
+        END AS Step_2,
+        CASE
+            WHEN cte3.d_index = 2 THEN cte3.end_method
+            WHEN cte3.sale_id IS NULL OR cte3.end_method IS NULL THEN 'Error'
+            ELSE 'Post-sale'
+        END AS Step_3,
+        CASE
+            WHEN cte3.d_index = 3 THEN cte3.end_method
+            WHEN cte3.sale_id IS NULL OR cte3.end_method IS NULL THEN 'Error'
+            ELSE 'Post-sale'
+        END AS Step_4,
+        CASE
+            WHEN cte3.d_index >= 4 THEN cte3.end_method
+            WHEN cte3.sale_id IS NULL OR cte3.end_method IS NULL THEN 'Error'
+            ELSE 'Post-sale'
+        END AS Step_5
+    FROM sales s
+    JOIN cte3
+    ON s.id = cte3.sale_id
+    JOIN products p
+    ON s.product_id = p.id
+    LEFT JOIN product_classes pc
+    ON p.product_class_id = pc.id
+    WHERE date_part('year', cte3.date) = 2023
+
+),
+
+-- bringing in the customer names
+cte5 AS (
+SELECT s.id, c.name
+FROM sales s
+LEFT JOIN customers c
+ON s.customer_id = c.id
+
+)
+
+-- creating the steps of the sankey and adding the sale amount and customer and class names and id's
+SELECT cte4.product_class_id, cte4.date, cte4.class_name,
+       cte4.Step_1 AS "Step 1",
+       cte4.Step_2 AS "Step 2",
+       cte4.Step_3 AS "Step 3",
+       cte4.Step_4 AS "Step 4",
+       cte4.Step_5 AS "Step 5",
+       SUM(cte4.sale_amount) as total_sale_amount,
+       cte5.name AS "Customer Name"
+FROM cte4
+LEFT JOIN cte5
+ON cte4.sale_id = cte5.id
+GROUP BY product_class_id, Step_1, Step_2, Step_3, Step_4, Step_5, cte4.date, cte5.name, cte4.class_name
+ORDER BY product_class_id, cte4.date, Step_1, Step_2, Step_3, Step_4, Step_5, cte5.name, cte4.class_name
+
