@@ -1,3 +1,4 @@
+-- sunburst
 -- Create a CTE that retrieves the product classes and their tier structure
 WITH tiered_product_classes AS (
     SELECT
@@ -7,18 +8,14 @@ WITH tiered_product_classes AS (
         (array_agg(tiers.name))[2] as tier_2,
         (array_agg(tiers.name))[3] as tier_3,
         (array_agg(tiers.name))[4] as tier_4
-    FROM sales s
-    LEFT JOIN products p
-    ON s.product_id = p.id
-    LEFT JOIN product_classes pc
-    ON p.product_class_id = pc.id
+    FROM product_classes pc
     JOIN LATERAL (
     SELECT name, row_number() OVER (ORDER BY t1.left) tier
     FROM product_classes t1
     WHERE t1.id != 1 AND t1.left <= pc.left AND t1.right >= pc.right
     ORDER BY t1.left
     ) AS tiers ON true
-    WHERE s.sale_amount > 0 AND pc.left = pc.right - 1
+    WHERE pc.left = pc.right - 1
     GROUP BY pc.id, pc.full_name
     ORDER BY tier_1, tier_2, tier_3, tier_4
 ),
@@ -32,9 +29,7 @@ fill_null_tiers AS (
         COALESCE(tier_3, CASE WHEN tier_3 IS NULL THEN tier_2 || ' (n)' ELSE tier_2 END, tier_1 || ' (n)') AS tier_3,
         COALESCE(tier_4, CASE WHEN tier_4 IS NULL THEN tier_3 || ' (n)' ELSE tier_3 END, tier_2 || ' (n)', tier_1 || ' (n)') AS tier_4
     FROM tiered_product_classes
-    ),
-
--- Create a CTE that adds parent information to each tier level
+),
 add_parents AS (
     SELECT
         p_c_id,
@@ -54,11 +49,10 @@ add_parents AS (
             WHEN POSITION('(n)' IN tier_3) = 0 THEN tier_3 || ' - ' || tier_2
             WHEN POSITION('(n)' IN tier_2) = 0 THEN tier_2 || ' - ' || tier_1
             ELSE tier_1
-        END AS leaf# Continue with the remaining parts of the query
-"""
+        END AS leaf
     FROM fill_null_tiers
     ORDER BY p_c_id
-),
+    ),
 
 -- Add in the sale_amount from sales
 sale_amounts AS (
@@ -86,7 +80,7 @@ sales_and_tiers AS (
         END AS n_value
     FROM sale_amounts sa
     LEFT JOIN add_parents ap
-    ON  sa.pcid = ap.p_c_id
+    ON  sa.pcid= ap.p_c_id
 ),
 
 -- Create a CTE that unpivots the tier information, so that each row contains information for a single tier
@@ -156,8 +150,6 @@ unpivoted AS (
 
 -- Grouped by product class id, if the component is the maximum "level" for that component, return "lowest level value"
 -- otherwise, sum up the "lowest level value" rows where the "Parent" matches the "component" in the current row.
--- Grouped by product class id, if the component is the maximum "level" for that component, return "lowest level value"
--- otherwise, sum up the "lowest level value" rows where the "Parent" matches the "component" in the current row.
 add_value AS (
     SELECT
         unpivoted.p_c_id AS prodid,
@@ -176,6 +168,7 @@ add_value AS (
         END AS value
     FROM unpivoted
 )
+
 -- Finally, select the desired columns and join the unpivoted CTE with the add_parents CTE
 SELECT
     u.*,
